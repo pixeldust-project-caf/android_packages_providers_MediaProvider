@@ -16,8 +16,12 @@
 
 package com.android.providers.media.photopicker;
 
+import static android.provider.CloudMediaProviderContract.EXTRA_GENERATION;
 import static android.provider.CloudMediaProviderContract.MediaColumns;
 import static android.provider.CloudMediaProviderContract.MediaInfo;
+import static com.android.providers.media.PickerUriResolver.getMediaUri;
+import static com.android.providers.media.PickerUriResolver.getDeletedMediaUri;
+import static com.android.providers.media.PickerUriResolver.getMediaInfoUri;
 
 import android.annotation.IntDef;
 import android.content.ContentResolver;
@@ -41,8 +45,8 @@ import android.util.Log;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
+import com.android.modules.utils.BackgroundThread;
 import com.android.providers.media.photopicker.data.PickerDbFacade;
-import com.android.providers.media.util.BackgroundThread;
 
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
@@ -63,7 +67,7 @@ public class PickerSyncController {
 
     public static final String LOCAL_PICKER_PROVIDER_AUTHORITY =
             "com.android.providers.media.photopicker";
-    private static final long DEFAULT_SYNC_DELAY_MS = 5000;
+    private static final long DEFAULT_SYNC_DELAY_MS = 1000;
 
     private static final int H_SYNC_PICKER = 1;
 
@@ -235,12 +239,21 @@ public class PickerSyncController {
     }
 
     public String getCloudProvider() {
-        return mCloudProvider;
+        synchronized (mLock) {
+            return mCloudProvider;
+        }
     }
 
     public String getLocalProvider() {
         return mLocalProvider;
     }
+
+    public boolean isProviderEnabled(String authority) {
+        synchronized (mLock) {
+            return authority.equals(mLocalProvider) || authority.equals(mCloudProvider);
+        }
+    }
+
 
     /**
      * Notifies about media events like inserts/updates/deletes from cloud and local providers and
@@ -272,7 +285,7 @@ public class PickerSyncController {
             // Sync media
             final Bundle queryArgs = new Bundle();
             final long cachedGeneration = cachedMediaInfo.getLong(MediaInfo.MEDIA_GENERATION);
-            queryArgs.putLong(MediaInfo.MEDIA_GENERATION, cachedGeneration);
+            queryArgs.putLong(EXTRA_GENERATION, cachedGeneration);
 
             try (Cursor cursor = query(getMediaUri(authority), queryArgs)) {
                 result = mDbFacade.addMedia(cursor, authority);
@@ -282,7 +295,7 @@ public class PickerSyncController {
 
             // Sync deleted_media
             final Bundle queryDeletedArgs = new Bundle();
-            queryDeletedArgs.putLong(MediaInfo.MEDIA_GENERATION, cachedGeneration);
+            queryDeletedArgs.putLong(EXTRA_GENERATION, cachedGeneration);
 
             try (Cursor cursor = query(getDeletedMediaUri(authority), queryDeletedArgs)) {
                 final int idIndex = cursor.getColumnIndex(MediaColumns.ID);
@@ -400,20 +413,5 @@ public class PickerSyncController {
     private Cursor query(Uri uri, Bundle extras) {
         return mContext.getContentResolver().query(uri, /* projection */ null, extras,
                 /* cancellationSignal */ null);
-    }
-
-    private static Uri getMediaUri(String authority) {
-        return Uri.parse("content://" + authority + "/"
-                + CloudMediaProviderContract.URI_PATH_MEDIA);
-    }
-
-    private static Uri getDeletedMediaUri(String authority) {
-        return Uri.parse("content://" + authority + "/"
-                + CloudMediaProviderContract.URI_PATH_DELETED_MEDIA);
-    }
-
-    private static Uri getMediaInfoUri(String authority) {
-        return Uri.parse("content://" + authority + "/"
-                + CloudMediaProviderContract.URI_PATH_MEDIA_INFO);
     }
 }

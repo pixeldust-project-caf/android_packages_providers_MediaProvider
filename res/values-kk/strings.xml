@@ -54,6 +54,13 @@
     <string name="picker_view_selected" msgid="2266031384396143883">"Таңдалғанды көру"</string>
     <string name="picker_photos" msgid="7415035516411087392">"Фотосуреттер"</string>
     <string name="picker_albums" msgid="4822511902115299142">"Aльбомдар"</string>
+    <string name="picker_work_profile" msgid="2083221066869141576">"Жұмыс профиліне ауысу"</string>
+    <string name="picker_personal_profile" msgid="639484258397758406">"Жеке профильге ауысу"</string>
+    <string name="picker_profile_admin_title" msgid="4172022376418293777">"Әкімшіңіз бөгеген"</string>
+    <string name="picker_profile_admin_msg_from_personal" msgid="1941639895084555723">"Жұмыс дерегіне жеке қолданбадан кіруге рұқсат жоқ."</string>
+    <string name="picker_profile_admin_msg_from_work" msgid="8048524337462790110">"Жеке дерекке жұмыс қолданбасынан кіруге рұқсат жоқ."</string>
+    <string name="picker_profile_work_paused_title" msgid="382212880704235925">"Жұмыс қолданбалары кідіртілді"</string>
+    <string name="picker_profile_work_paused_msg" msgid="6321552322125246726">"Жұмыс аккаунтындағы фотосуреттерді ашу үшін жұмыс қолданбаларын қосып, содан кейін қайталап көріңіз."</string>
     <plurals name="picker_album_item_count" formatted="false" msgid="1706547226783599356">
       <item quantity="other"><xliff:g id="COUNT_1">^1</xliff:g> элемент</item>
       <item quantity="one"><xliff:g id="COUNT_0">^1</xliff:g> элемент</item>

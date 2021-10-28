@@ -33,6 +33,7 @@ import android.app.AppOpsManager;
 import android.app.PendingIntent;
 import android.compat.annotation.UnsupportedAppUsage;
 import android.content.ClipData;
+import android.content.ContentProvider;
 import android.content.ContentProviderClient;
 import android.content.ContentResolver;
 import android.content.ContentUris;
@@ -60,6 +61,7 @@ import android.os.OperationCanceledException;
 import android.os.ParcelFileDescriptor;
 import android.os.Parcelable;
 import android.os.RemoteException;
+import android.os.UserHandle;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
 import android.text.TextUtils;
@@ -216,6 +218,8 @@ public final class MediaStore {
     public static final String GET_REDACTED_MEDIA_URI_LIST_CALL = "get_redacted_media_uri_list";
     /** {@hide} */
     public static final String EXTRA_URI_LIST = "uri_list";
+    /** {@hide} */
+    public static final String QUERY_ARG_REDACTED_URI = "android:query-arg-redacted-uri";
 
     /** {@hide} */
     public static final String EXTRA_URI = "uri";
@@ -242,6 +246,8 @@ public final class MediaStore {
     public static final String SYNC_PROVIDERS_CALL = "sync_providers";
     /** {@hide} */
     public static final String SET_CLOUD_PROVIDER_CALL = "set_cloud_provider";
+    /** {@hide} */
+    public static final String EXTRA_CLOUD_PROVIDER = "cloud_provider";
 
     /** {@hide} */
     public static final String QUERY_ARG_LIMIT = ContentResolver.QUERY_ARG_LIMIT;
@@ -270,6 +276,16 @@ public final class MediaStore {
     public static final String PARAM_REQUIRE_ORIGINAL = "requireOriginal";
     /** {@hide} */
     public static final String PARAM_LIMIT = "limit";
+
+    /** {@hide} */
+    private static final int MY_USER_ID = UserHandle.myUserId();
+    /** {@hide} */
+    public static final int MY_UID = android.os.Process.myUid();
+    // Stolen from: UserHandle#getUserId
+    /** {@hide} */
+    public static final int PER_USER_RANGE = 100000;
+
+    private static final int PICK_IMAGES_MAX_LIMIT = 100;
 
     /**
      * Activity Action: Launch a music player.
@@ -662,13 +678,13 @@ public final class MediaStore {
      * <p>
      * If the caller needs multiple returned items (or caller wants to allow
      * multiple selection), then it can specify
-     * {@link Intent#EXTRA_ALLOW_MULTIPLE} to indicate this. When multiple
-     * selection is enabled, callers can also constrain number of selection
-     * using {@link MediaStore#EXTRA_PICK_IMAGES_MIN} and
-     * {@link MediaStore#EXTRA_PICK_IMAGES_MAX}.
-     * When there is no constraint on number of items, all of the user selected
-     * items are returned. TODO(b/185782624): Add constraint on maximum items
-     * picker can return.
+     * {@link MediaStore#EXTRA_PICK_IMAGES_MAX} to indicate this.
+     * <p>
+     * When the caller requests multiple selection, the value of
+     * {@link MediaStore#EXTRA_PICK_IMAGES_MAX} must be a positive integer
+     * greater than 1 and less than or equal to
+     * {@link MediaStore#getPickImagesMaxLimit}, otherwise
+     * {@link Activity#RESULT_CANCELED} is returned.
      * <p>
      * Output: MediaStore content URI(s) of the item(s) that was picked.
      */
@@ -676,24 +692,26 @@ public final class MediaStore {
     public static final String ACTION_PICK_IMAGES = "android.provider.action.PICK_IMAGES";
 
     /**
-     * The name of an optional intent-extra used to constrain minimum number of
-     * items that should be returned by {@link MediaStore#ACTION_PICK_IMAGES},
-     * action may still return nothing (0 items) if the user chooses to cancel.
-     * The value of this intext-extra should be a non-negative integer less than
-     * or equal to {@link MediaStore#EXTRA_PICK_IMAGES_MAX}, the value is
-     * ignored otherwise.
-     */
-    public final static String EXTRA_PICK_IMAGES_MIN = "android.provider.extra.PICK_IMAGES_MIN";
-
-    /**
-     * The name of an optional intent-extra used to constrain maximum number of
-     * items that can be returned by {@link MediaStore#ACTION_PICK_IMAGES},
-     * action may still return nothing (0 items) if the user chooses to cancel.
-     * The value of this intext-extra should be a non-negative integer greater
-     * than or equal to {@link MediaStore#EXTRA_PICK_IMAGES_MIN}, the value
-     * is ignored otherwise.
+     * The name of an optional intent-extra used to allow multiple selection of
+     * items and constrain maximum number of items that can be returned by
+     * {@link MediaStore#ACTION_PICK_IMAGES}, action may still return nothing
+     * (0 items) if the user chooses to cancel.
+     * <p>
+     * The value of this intent-extra should be a positive integer greater
+     * than 1 and less than or equal to
+     * {@link MediaStore#getPickImagesMaxLimit}, otherwise
+     * {@link Activity#RESULT_CANCELED} is returned.
      */
     public final static String EXTRA_PICK_IMAGES_MAX = "android.provider.extra.PICK_IMAGES_MAX";
+
+    /**
+     * The maximum limit for the number of items that can be selected using
+     * {@link MediaStore#ACTION_PICK_IMAGES} when launched in multiple selection mode.
+     * This can be used as a constant value for {@link MediaStore#EXTRA_PICK_IMAGES_MAX}.
+     */
+    public static int getPickImagesMaxLimit() {
+        return PICK_IMAGES_MAX_LIMIT;
+    }
 
     /**
      * Specify that the caller wants to receive the original media format without transcoding.
@@ -4302,6 +4320,48 @@ public final class MediaStore {
         return out.getBoolean(EXTRA_IS_SYSTEM_GALLERY_RESPONSE);
     }
 
+    private static Uri maybeRemoveUserId(@NonNull Uri uri) {
+        if (uri.getUserInfo() == null) return uri;
+
+        Uri.Builder builder = uri.buildUpon();
+        builder.authority(uri.getHost());
+        return builder.build();
+    }
+
+    private static List<Uri> maybeRemoveUserId(@NonNull List<Uri> uris) {
+        List<Uri> newUriList = new ArrayList<>();
+        for (Uri uri : uris) {
+            newUriList.add(maybeRemoveUserId(uri));
+        }
+        return newUriList;
+    }
+
+    private static int getUserIdFromUri(Uri uri) {
+        final String userId = uri.getUserInfo();
+        return userId == null ? MY_USER_ID : Integer.parseInt(userId);
+    }
+
+    private static Uri maybeAddUserId(@NonNull Uri uri, String userId) {
+        if (userId == null) {
+            return uri;
+        }
+
+        return ContentProvider.createContentUriForUser(uri,
+            UserHandle.of(Integer.parseInt(userId)));
+    }
+
+    private static List<Uri> maybeAddUserId(@NonNull List<Uri> uris, String userId) {
+        if (userId == null) {
+            return uris;
+        }
+
+        List<Uri> newUris = new ArrayList<>();
+        for (Uri uri : uris) {
+            newUris.add(maybeAddUserId(uri, userId));
+        }
+        return newUris;
+    }
+
     /**
      * Returns an EXIF redacted version of {@code uri} i.e. a {@link Uri} with metadata such as
      * location, GPS datestamp etc. redacted from the EXIF headers.
@@ -4324,13 +4384,30 @@ public final class MediaStore {
      */
     @Nullable
     public static Uri getRedactedUri(@NonNull ContentResolver resolver, @NonNull Uri uri) {
-        try (ContentProviderClient client = resolver.acquireContentProviderClient(AUTHORITY)) {
+        final String authority = uri.getAuthority();
+        try (ContentProviderClient client = resolver.acquireContentProviderClient(authority)) {
             final Bundle in = new Bundle();
-            in.putParcelable(EXTRA_URI, uri);
+            final String userId = uri.getUserInfo();
+            // NOTE: The user-id in URI authority is ONLY required to find the correct MediaProvider
+            // process. Once in the correct process, the field is no longer required and may cause
+            // breakage in MediaProvider code. This is because per process logic is agnostic of
+            // user-id. Hence strip away the user ids from URI, if present.
+            in.putParcelable(EXTRA_URI, maybeRemoveUserId(uri));
             final Bundle out = client.call(GET_REDACTED_MEDIA_URI_CALL, null, in);
-            return out.getParcelable(EXTRA_URI);
+            // Add the user-id back to the URI if we had striped it earlier.
+            return maybeAddUserId((Uri) out.getParcelable(EXTRA_URI), userId);
         } catch (RemoteException e) {
             throw e.rethrowAsRuntimeException();
+        }
+    }
+
+    private static void verifyUrisBelongToSingleUserId(@NonNull List<Uri> uris) {
+        final int userId = getUserIdFromUri(uris.get(0));
+        for (Uri uri : uris) {
+            if (userId != getUserIdFromUri(uri)) {
+                throw new IllegalArgumentException(
+                    "All the uris should belong to a single user-id");
+            }
         }
     }
 
@@ -4354,16 +4431,26 @@ public final class MediaStore {
      * when the corresponding {@link Uri} could not be found or is unsupported
      * @throws SecurityException if the caller doesn't have the read access to all the elements
      * in {@code uris}
+     * @throws IllegalArgumentException if all the uris in {@code uris} don't belong to same user id
      * @see #getRedactedUri(ContentResolver, Uri)
      */
     @NonNull
     public static List<Uri> getRedactedUri(@NonNull ContentResolver resolver,
             @NonNull List<Uri> uris) {
-        try (ContentProviderClient client = resolver.acquireContentProviderClient(AUTHORITY)) {
+        verifyUrisBelongToSingleUserId(uris);
+        final String authority = uris.get(0).getAuthority();
+        try (ContentProviderClient client = resolver.acquireContentProviderClient(authority)) {
+            final String userId = uris.get(0).getUserInfo();
             final Bundle in = new Bundle();
-            in.putParcelableArrayList(EXTRA_URI_LIST, (ArrayList<? extends Parcelable>) uris);
+            // NOTE: The user-id in URI authority is ONLY required to find the correct MediaProvider
+            // process. Once in the correct process, the field is no longer required and may cause
+            // breakage in MediaProvider code. This is because per process logic is agnostic of
+            // user-id. Hence strip away the user ids from URIs, if present.
+            in.putParcelableArrayList(EXTRA_URI_LIST,
+                (ArrayList<? extends Parcelable>) maybeRemoveUserId(uris));
             final Bundle out = client.call(GET_REDACTED_MEDIA_URI_LIST_CALL, null, in);
-            return out.getParcelableArrayList(EXTRA_URI_LIST);
+            // Add the user-id back to the URI if we had striped it earlier.
+            return maybeAddUserId(out.getParcelableArrayList(EXTRA_URI_LIST), userId);
         } catch (RemoteException e) {
             throw e.rethrowAsRuntimeException();
         }

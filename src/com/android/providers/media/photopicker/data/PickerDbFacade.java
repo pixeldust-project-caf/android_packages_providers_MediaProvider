@@ -27,12 +27,14 @@ import android.net.Uri;
 import android.provider.CloudMediaProviderContract;
 import android.provider.MediaStore.MediaColumns;
 import android.os.Bundle;
+import android.os.SystemProperties;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
 import com.android.providers.media.photopicker.PickerSyncController;
+import com.android.providers.media.photopicker.data.model.Item;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -67,9 +69,6 @@ public class PickerDbFacade {
     private static final int SUCCESS = 1;
     private static final int FAIL = -1;
 
-    public static final String KEY_LOCAL_PROVIDER = "local_provider";
-    public static final String KEY_CLOUD_PROVIDER = "cloud_provider";
-
     private static final String TABLE_MEDIA = "media";
 
     @VisibleForTesting
@@ -88,6 +87,23 @@ public class PickerDbFacade {
     public static final String KEY_DURATION_MS = "duration_ms";
     @VisibleForTesting
     public static final String KEY_MIME_TYPE = "mime_type";
+    @VisibleForTesting
+    public static final String KEY_IS_FAVORITE = "is_favorite";
+
+    // We prefer cloud_id first and it only matters for cloud+local items. For those, the row
+    // will already be associated with a cloud authority, see #getProjectionAuthorityLocked.
+    // Note that hidden cloud+local items will not be returned in the query, so there's no concern
+    // of preferring the cloud_id in a cloud+local item over the local_id in a local-only item.
+    private static final String PROJECTION_ID = String.format("IFNULL(%s, %s) AS %s", KEY_CLOUD_ID,
+            KEY_LOCAL_ID, CloudMediaProviderContract.MediaColumns.ID);
+    private static final String PROJECTION_DATE_TAKEN = String.format("%s AS %s", KEY_DATE_TAKEN_MS,
+            CloudMediaProviderContract.MediaColumns.DATE_TAKEN_MS);
+    private static final String PROJECTION_SIZE = String.format("%s AS %s", KEY_SIZE_BYTES,
+            CloudMediaProviderContract.MediaColumns.SIZE_BYTES);
+    private static final String PROJECTION_DURATION = String.format("%s AS %s", KEY_DURATION_MS,
+            CloudMediaProviderContract.MediaColumns.DURATION_MS);
+    private static final String PROJECTION_MIME_TYPE = String.format("%s AS %s", KEY_MIME_TYPE,
+            CloudMediaProviderContract.MediaColumns.MIME_TYPE);
 
     private static final String WHERE_ID = KEY_ID + " = ?";
     private static final String WHERE_LOCAL_ID = KEY_LOCAL_ID + " = ?";
@@ -96,11 +112,14 @@ public class PickerDbFacade {
     private static final String WHERE_NOT_NULL_CLOUD_ID = KEY_CLOUD_ID + " IS NOT NULL";
     private static final String WHERE_IS_VISIBLE = KEY_IS_VISIBLE + " = 1";
     private static final String WHERE_MIME_TYPE = KEY_MIME_TYPE + " LIKE ? ";
+    private static final String WHERE_IS_FAVORITE = KEY_IS_FAVORITE + " = 1";
     private static final String WHERE_SIZE_BYTES = KEY_SIZE_BYTES + " <= ?";
     private static final String WHERE_DATE_TAKEN_MS_AFTER =
-            "date_taken_ms > ? OR (date_taken_ms = ? AND _id > ?)";
+            String.format("%s > ? OR (%s = ? AND %s > ?)",
+                    KEY_DATE_TAKEN_MS, KEY_DATE_TAKEN_MS, KEY_ID);
     private static final String WHERE_DATE_TAKEN_MS_BEFORE =
-            "date_taken_ms < ? OR (date_taken_ms = ? AND _id < ?)";
+            String.format("%s < ? OR (%s = ? AND %s < ?)",
+                    KEY_DATE_TAKEN_MS, KEY_DATE_TAKEN_MS, KEY_ID);
 
     // Matches all media including cloud+local, cloud-only and local-only
     private static final SQLiteQueryBuilder QB_MATCH_ALL = createMediaQueryBuilder();
@@ -384,21 +403,99 @@ public class PickerDbFacade {
                 /* columnIndex */ 0);
     }
 
-    /*
-     * Returns sorted and deduped cloud and local media items from the picker db.
-     *
-     * Returns a {@link Cursor} containing the most recent picker db media rows sorted in reverse
-     * chronological order, i.e. newest first, up to a maximum of {@code limit}.
-     *
-     * The results can be further filtered with the {@code mimeTypeFilter} and {@code sizeBytesMax}
-     * filters.
-     */
-    public Cursor queryMediaAll(int limit, String mimeTypeFilter, long sizeBytesMax) {
-        final SQLiteQueryBuilder qb = createVisibleMediaQueryBuilder();
-        final String[] selectionArgs = buildSelectionArgs(qb, /* isQueryAfter */ false,
-                /* dateTakenMs */ 0, /* id */ 0, mimeTypeFilter, sizeBytesMax);
+    /** Filter for {@link #queryMedia} to modify returned results */
+    public static class QueryFilter {
+        private final int limit;
+        private final long dateTakenBeforeMs;
+        private final long dateTakenAfterMs;
+        private final long id;
+        private final long sizeBytes;
+        private final String mimeType;
+        private final boolean isFavorite;
 
-        return queryMedia(qb, selectionArgs, limit);
+        private QueryFilter(int limit, long dateTakenBeforeMs, long dateTakenAfterMs, long id,
+                long sizeBytes, String mimeType, boolean isFavorite) {
+            this.limit = limit;
+            this.dateTakenBeforeMs = dateTakenBeforeMs;
+            this.dateTakenAfterMs = dateTakenAfterMs;
+            this.id = id;
+            this.sizeBytes = sizeBytes;
+            this.mimeType = mimeType;
+            this.isFavorite = isFavorite;
+        }
+    }
+
+    /** Builder for {@link Query} filter. */
+    public static class QueryFilterBuilder {
+        public static final long LONG_DEFAULT = -1;
+        public static final String STRING_DEFAULT = null;
+        public static final boolean BOOLEAN_DEFAULT = false;
+
+        public static final int LIMIT_DEFAULT = 1000;
+
+        private final int limit;
+        private long dateTakenBeforeMs = LONG_DEFAULT;
+        private long dateTakenAfterMs = LONG_DEFAULT;
+        private long id = LONG_DEFAULT;
+        private long sizeBytes = LONG_DEFAULT;
+        private String mimeType = STRING_DEFAULT;
+        private boolean isFavorite = BOOLEAN_DEFAULT;
+
+        public QueryFilterBuilder(int limit) {
+            this.limit = limit;
+        }
+
+        public QueryFilterBuilder setDateTakenBeforeMs(long dateTakenBeforeMs) {
+            this.dateTakenBeforeMs = dateTakenBeforeMs;
+            return this;
+        }
+
+        public QueryFilterBuilder setDateTakenAfterMs(long dateTakenAfterMs) {
+            this.dateTakenAfterMs = dateTakenAfterMs;
+            return this;
+        }
+
+        /**
+         * The {@code id} helps break ties with db rows having the same {@code dateTakenAfterMs} or
+         * {@code dateTakenBeforeMs}.
+         *
+         * If {@code dateTakenAfterMs} is specified, all returned items are either strictly more
+         * recent than {@code dateTakenAfterMs} or have a picker db id strictly greater than
+         * {@code id} for ties.
+         *
+         * If {@code dateTakenBeforeMs} is specified, all returned items are either strictly older
+         * than {@code dateTakenBeforeMs} or have a picker db id strictly less than {@code id}
+         * for ties.
+         */
+        public QueryFilterBuilder setId(long id) {
+            this.id = id;
+            return this;
+        }
+
+        public QueryFilterBuilder setSizeBytes(long sizeBytes) {
+            this.sizeBytes = sizeBytes;
+            return this;
+        }
+
+        public QueryFilterBuilder setMimeType(String mimeType) {
+            this.mimeType = mimeType;
+            return this;
+        }
+
+        /**
+         * If {@code isFavorite} is {@code true}, the {@link QueryFilter} returns only
+         * favorited items, however, if it is {@code false}, it returns all items including
+         * favorited and non-favorited items.
+         */
+        public QueryFilterBuilder setIsFavorite(boolean isFavorite) {
+            this.isFavorite = isFavorite;
+            return this;
+        }
+
+        public QueryFilter build() {
+            return new QueryFilter(limit, dateTakenBeforeMs, dateTakenAfterMs, id, sizeBytes,
+                    mimeType, isFavorite);
+        }
     }
 
     /*
@@ -407,78 +504,77 @@ public class PickerDbFacade {
      * Returns a {@link Cursor} containing picker db media rows sorted in reverse chronological
      * order, i.e. newest first, up to a maximum of {@code limit}.
      *
-     * All returned items are either strictly more recent than {@code dateTakenMs} or if
-     * they were captured at the same time, have a picker db id strictly greater than {@code id}.
-     *
-     * The results can be further filtered with the {@code mimeTypeFilter} and {@code sizeBytesMax}
-     * filters.
+     * The results can be filtered with {@code query}.
      */
-    public Cursor queryMediaAfter(long dateTakenMs, long id, int limit, String mimeTypeFilter,
-            long sizeBytesMax) {
+    public Cursor queryMedia(QueryFilter query) {
         final SQLiteQueryBuilder qb = createVisibleMediaQueryBuilder();
-        final String[] selectArgs = buildSelectionArgs(qb, /* isQueryAfter */ true, dateTakenMs, id,
-                mimeTypeFilter, sizeBytesMax);
+        final String[] selectionArgs = buildSelectionArgs(qb, query);
 
-        return queryMedia(qb, selectArgs, limit);
+        return queryMedia(qb, selectionArgs, query.limit);
     }
 
-    /*
-     * Returns sorted and deduped cloud and local media items from the picker db.
-     *
-     * Returns a {@link Cursor} containing picker db media rows sorted in reverse chronological
-     * order, i.e. newest first, up to a maximum of {@code limit}.
-     *
-     * All returned items are either strictly older than {@code dateTakenMs} or if
-     * they were captured at the same time, have a picker db id strictly less than {@code id}.
-     *
-     * The results can be further filtered with the {@code mimeTypeFilter} and {@code sizeBytesMax}
-     * filters.
-     */
-    public Cursor queryMediaBefore(long dateTakenMs, long id, int limit, String mimeTypeFilter,
-            long sizeBytesMax) {
-        SQLiteQueryBuilder qb = createVisibleMediaQueryBuilder();
-        String[] selectArgs = buildSelectionArgs(qb, /* isQueryAfter */ false, dateTakenMs, id,
-                mimeTypeFilter, sizeBytesMax);
+    public Cursor queryMediaId(String authority, String mediaId) {
+        final String[] selectionArgs = new String[] { mediaId };
+        final SQLiteQueryBuilder qb = createVisibleMediaQueryBuilder();
+        if (isLocal(authority)) {
+            qb.appendWhereStandalone(WHERE_LOCAL_ID);
+        } else {
+            qb.appendWhereStandalone(WHERE_CLOUD_ID);
+        }
 
-        return queryMedia(qb, selectArgs, limit);
+        synchronized (mLock) {
+            if (authority.equals(mLocalProvider) || authority.equals(mCloudProvider)) {
+                return qb.query(mDatabase, getProjectionLocked(), /* selection */ null,
+                        selectionArgs, /* groupBy */ null, /* having */ null, /* orderBy */ null,
+                        /* limitStr */ null);
+            }
+        }
+
+        return null;
+    }
+
+    public static boolean isPickerDbEnabled() {
+        return SystemProperties.getBoolean("sys.photopicker.pickerdb.enabled", false);
     }
 
     private Cursor queryMedia(SQLiteQueryBuilder qb, String[] selectionArgs, int limit) {
-        final String[] projection = new String[] {
-            KEY_LOCAL_ID,
-            KEY_CLOUD_ID,
-            KEY_DATE_TAKEN_MS,
-            KEY_SIZE_BYTES,
-            KEY_DURATION_MS,
-            KEY_MIME_TYPE
-        };
-
-        final String orderBy = "date_taken_ms DESC,_id DESC";
+        // Use the <table>.<column> form to order _id to avoid ordering against the projection '_id'
+        final String orderBy = "date_taken_ms DESC," + TABLE_MEDIA + "._id DESC";
         final String limitStr = String.valueOf(limit);
-
-        final Cursor cursor;
-        final Bundle bundle = new Bundle();
-        bundle.putString(KEY_LOCAL_PROVIDER, mLocalProvider);
 
         // Hold lock while checking the cloud provider and querying so that cursor extras containing
         // the cloud provider is consistent with the cursor results and doesn't race with
         // #setCloudProvider
         synchronized (mLock) {
             if (mCloudProvider == null) {
-                // If cloud provider is null, avoid all cloud items in the picker db
+                // If cloud provider is null, skip all cloud items in the picker db
                 qb.appendWhereStandalone(WHERE_NULL_CLOUD_ID);
-            } else {
-                // If cloud provider is not null, return the current cloud provider as part of the
-                // cursor result
-                bundle.putString(KEY_CLOUD_PROVIDER, mCloudProvider);
             }
 
-            cursor = qb.query(mDatabase, projection, /* selection */ null, selectionArgs,
+            return qb.query(mDatabase, getProjectionLocked(), /* selection */ null, selectionArgs,
                     /* groupBy */ null, /* having */ null, orderBy, limitStr);
         }
+    }
 
-        cursor.setExtras(bundle);
-        return cursor;
+    private String[] getProjectionLocked() {
+        return new String[] {
+            getProjectionAuthorityLocked(),
+            PROJECTION_ID,
+            PROJECTION_DATE_TAKEN,
+            PROJECTION_SIZE,
+            PROJECTION_DURATION,
+            PROJECTION_MIME_TYPE
+        };
+    }
+
+    private String getProjectionAuthorityLocked() {
+        if (mCloudProvider == null) {
+            return String.format("'%s' AS %s", mLocalProvider,
+                    CloudMediaProviderContract.MediaColumns.AUTHORITY);
+        }
+        return String.format("IIF(%s IS NULL, '%s', '%s') AS %s",
+                KEY_CLOUD_ID, mLocalProvider, mCloudProvider,
+                CloudMediaProviderContract.MediaColumns.AUTHORITY);
     }
 
     private static ContentValues cursorToContentValue(Cursor cursor, boolean isLocal) {
@@ -515,35 +611,47 @@ public class PickerDbFacade {
                 case CloudMediaProviderContract.MediaColumns.DURATION_MS:
                     values.put(KEY_DURATION_MS, cursor.getLong(index));
                     break;
+                case CloudMediaProviderContract.MediaColumns.IS_FAVORITE:
+                    values.put(KEY_IS_FAVORITE, cursor.getInt(index));
+                    break;
+                default:
+                    Log.w(TAG, "Unexpected cursor key: " + key);
             }
         }
 
         return values;
     }
 
-    private static String[] buildSelectionArgs(SQLiteQueryBuilder qb, boolean isQueryAfter,
-            long dateTakenMs, long id, String mimeTypeFilter, long sizeBytesMax) {
+    private static String[] buildSelectionArgs(SQLiteQueryBuilder qb, QueryFilter query) {
         List<String> selectArgs = new ArrayList<>();
 
-        if (id > 0) {
-            if (isQueryAfter) {
+        if (query.id >= 0) {
+            if (query.dateTakenAfterMs >= 0) {
                 qb.appendWhereStandalone(WHERE_DATE_TAKEN_MS_AFTER);
+                // Add date args twice because the sql statement evaluates date twice
+                selectArgs.add(String.valueOf(query.dateTakenAfterMs));
+                selectArgs.add(String.valueOf(query.dateTakenAfterMs));
             } else {
                 qb.appendWhereStandalone(WHERE_DATE_TAKEN_MS_BEFORE);
+                // Add date args twice because the sql statement evaluates date twice
+                selectArgs.add(String.valueOf(query.dateTakenBeforeMs));
+                selectArgs.add(String.valueOf(query.dateTakenBeforeMs));
             }
-            selectArgs.add(String.valueOf(dateTakenMs));
-            selectArgs.add(String.valueOf(dateTakenMs));
-            selectArgs.add(String.valueOf(id));
+            selectArgs.add(String.valueOf(query.id));
         }
 
-        if (sizeBytesMax > 0) {
+        if (query.sizeBytes >= 0) {
             qb.appendWhereStandalone(WHERE_SIZE_BYTES);
-            selectArgs.add(String.valueOf(sizeBytesMax));
+            selectArgs.add(String.valueOf(query.sizeBytes));
         }
 
-        if (mimeTypeFilter != null) {
+        if (query.mimeType != null) {
             qb.appendWhereStandalone(WHERE_MIME_TYPE);
-            selectArgs.add(mimeTypeFilter.replace('*', '%'));
+            selectArgs.add(query.mimeType.replace('*', '%'));
+        }
+
+        if (query.isFavorite) {
+            qb.appendWhereStandalone(WHERE_IS_FAVORITE);
         }
 
         if (selectArgs.isEmpty()) {

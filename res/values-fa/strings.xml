@@ -54,6 +54,13 @@
     <string name="picker_view_selected" msgid="2266031384396143883">"مشاهده موارد انتخاب‌شده"</string>
     <string name="picker_photos" msgid="7415035516411087392">"عکس‌ها"</string>
     <string name="picker_albums" msgid="4822511902115299142">"آلبوم‌ها"</string>
+    <string name="picker_work_profile" msgid="2083221066869141576">"رفتن به نمایه کاری"</string>
+    <string name="picker_personal_profile" msgid="639484258397758406">"رفتن به نمایه شخصی"</string>
+    <string name="picker_profile_admin_title" msgid="4172022376418293777">"سرپرست آن را مسدود کرده است"</string>
+    <string name="picker_profile_admin_msg_from_personal" msgid="1941639895084555723">"دسترسی به داده‌های کاری ازطریق برنامه شخصی مجاز نیست"</string>
+    <string name="picker_profile_admin_msg_from_work" msgid="8048524337462790110">"دسترسی به داده‌های شخصی ازطریق برنامه کاری مجاز نیست"</string>
+    <string name="picker_profile_work_paused_title" msgid="382212880704235925">"برنامه‌های کاری موقتاً متوقف شده‌اند."</string>
+    <string name="picker_profile_work_paused_msg" msgid="6321552322125246726">"برای باز کردن عکس‌های کاری، برنامه‌های کاری را روشن کنید و سپس دوباره امتحان کنید"</string>
     <plurals name="picker_album_item_count" formatted="false" msgid="1706547226783599356">
       <item quantity="one"><xliff:g id="COUNT_1">^1</xliff:g> مورد</item>
       <item quantity="other"><xliff:g id="COUNT_1">^1</xliff:g> مورد</item>
