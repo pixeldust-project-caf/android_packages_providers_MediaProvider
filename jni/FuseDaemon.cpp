@@ -549,12 +549,16 @@ static node* make_node_entry(fuse_req_t req, node* parent, const string& name, c
     const int transforms = file_lookup_result->transforms;
     const int transforms_reason = file_lookup_result->transforms_reason;
     const string& io_path = file_lookup_result->io_path;
+    if (transforms) {
+        // If the node requires transforms, we MUST never cache it in the VFS
+        CHECK(should_invalidate);
+    }
 
     node = parent->LookupChildByName(name, true /* acquire */, transforms);
     if (!node) {
         ino_t ino = e->attr.st_ino;
-        node = ::node::Create(parent, name, io_path, should_invalidate, transforms_complete,
-                              transforms, transforms_reason, &fuse->lock, ino, &fuse->tracker);
+        node = ::node::Create(parent, name, io_path, transforms_complete, transforms,
+                              transforms_reason, &fuse->lock, ino, &fuse->tracker);
     } else if (!mediaprovider::fuse::containsMount(path)) {
         // Only invalidate a path if it does not contain mount and |name| != node->GetName.
         // Invalidate both names to ensure there's no dentry left in the kernel after the following
@@ -588,6 +592,21 @@ static node* make_node_entry(fuse_req_t req, node* parent, const string& name, c
         node->SetTransformsComplete(transforms_complete);
     }
     TRACE_NODE(node, req);
+
+    if (should_invalidate && fuse->IsTranscodeSupportedPath(path)) {
+        // Some components like the MTP stack need an efficient mechanism to determine if a file
+        // supports transcoding. This allows them workaround an issue with MTP clients on windows
+        // where those clients incorrectly use the original file size instead of the transcoded file
+        // size to copy files from the device. This size misuse causes transcoded files to be
+        // truncated to the original file size, hence corrupting the transcoded file.
+        //
+        // We expose the transcode bit via the st_nlink stat field. This should be safe because the
+        // field is not supported on FAT filesystems which FUSE is emulating.
+        // WARNING: Apps should never rely on this behavior as it is NOT supported API and will be
+        // removed in a future release when the MTP stack has better support for transcoded files on
+        // Windows OS.
+        e->attr.st_nlink = 2;
+    }
 
     // This FS is not being exported via NFS so just a fixed generation number
     // for now. If we do need this, we need to increment the generation ID each
@@ -1178,7 +1197,8 @@ static void pf_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t new_parent,
 
 static handle* create_handle_for_node(struct fuse* fuse, const string& path, int fd, uid_t uid,
                                       uid_t transforms_uid, node* node, const RedactionInfo* ri,
-                                      const bool open_info_direct_io, int* keep_cache) {
+                                      const bool allow_passthrough, const bool open_info_direct_io,
+                                      int* keep_cache) {
     std::lock_guard<std::recursive_mutex> guard(fuse->lock);
 
     bool redaction_needed = ri->isRedactionNeeded();
@@ -1189,7 +1209,7 @@ static handle* create_handle_for_node(struct fuse* fuse, const string& path, int
         CHECK(transforms);
     }
 
-    if (fuse->passthrough) {
+    if (fuse->passthrough && allow_passthrough) {
         *keep_cache = transforms_complete;
         // We only enabled passthrough iff these 2 conditions hold
         // 1. Redaction is not needed
@@ -1330,7 +1350,8 @@ static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
     }
 
     int fd = -1;
-    if (result->fd >= 0) {
+    const bool is_fd_from_java = result->fd >= 0;
+    if (is_fd_from_java) {
         fd = result->fd;
         TRACE_NODE(node, req) << "opened in Java";
     } else {
@@ -1342,8 +1363,11 @@ static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
     }
 
     int keep_cache = 1;
+    // If is_fd_from_java==true, we disallow passthrough because the fd can be pointing to the
+    // FUSE fs if gotten from another process
     const handle* h = create_handle_for_node(fuse, io_path, fd, result->uid, result->transforms_uid,
                                              node, result->redaction_info.release(),
+                                             /* allow_passthrough */ !is_fd_from_java,
                                              open_info.direct_io, &keep_cache);
     fill_fuse_file_info(h, &open_info, keep_cache, fi);
 
@@ -1892,9 +1916,9 @@ static void pf_create(fuse_req_t req,
     // to the file before all the EXIF content is written. We could special case reads before the
     // first close after a file has just been created.
     int keep_cache = 1;
-    const handle* h =
-            create_handle_for_node(fuse, child_path, fd, req->ctx.uid, 0 /* transforms_uid */, node,
-                                   new RedactionInfo(), open_info.direct_io, &keep_cache);
+    const handle* h = create_handle_for_node(
+            fuse, child_path, fd, req->ctx.uid, 0 /* transforms_uid */, node, new RedactionInfo(),
+            /* allow_passthrough */ true, open_info.direct_io, &keep_cache);
     fill_fuse_file_info(h, &open_info, keep_cache, fi);
 
     // TODO(b/173190192) ensuring that h->cached must be enabled in order to
