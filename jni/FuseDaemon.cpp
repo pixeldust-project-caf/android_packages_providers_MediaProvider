@@ -17,10 +17,10 @@
 #define LIBFUSE_LOG_TAG "libfuse"
 
 #include "FuseDaemon.h"
-#include "android-base/strings.h"
 
 #include <android-base/logging.h>
 #include <android-base/properties.h>
+#include <android-base/strings.h>
 #include <android/log.h>
 #include <android/trace.h>
 #include <ctype.h>
@@ -28,11 +28,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fuse_i.h>
+#include <fuse_kernel.h>
 #include <fuse_log.h>
 #include <fuse_lowlevel.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <linux/fuse.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,7 +51,6 @@
 #include <unistd.h>
 
 #include <iostream>
-#include <list>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -61,6 +60,8 @@
 #include <unordered_set>
 #include <vector>
 
+#define BPF_FD_JUST_USE_INT
+#include "BpfSyscallWrappers.h"
 #include "MediaProviderWrapper.h"
 #include "libfuse_jni/FuseUtils.h"
 #include "libfuse_jni/ReaddirHelper.h"
@@ -72,7 +73,6 @@ using mediaprovider::fuse::dirhandle;
 using mediaprovider::fuse::handle;
 using mediaprovider::fuse::node;
 using mediaprovider::fuse::RedactionInfo;
-using std::list;
 using std::string;
 using std::vector;
 
@@ -117,10 +117,18 @@ const std::string MY_USER_ID_STRING(std::to_string(MY_UID / PER_USER_RANGE));
 const std::regex PATTERN_OWNED_PATH(
         "^/storage/[^/]+/(?:[0-9]+/)?Android/(?:data|obb)/([^/]+)(/?.*)?",
         std::regex_constants::icase);
+const std::regex PATTERN_DATA_PATH("^/storage/[^/]+/(?:[0-9]+/)?Android/data$",
+                                   std::regex_constants::icase);
+const std::regex PATTERN_OBB_PATH("^/storage/[^/]+/(?:[0-9]+/)?Android/obb$",
+                                  std::regex_constants::icase);
 
 static constexpr char TRANSFORM_SYNTHETIC_DIR[] = "synthetic";
 static constexpr char TRANSFORM_TRANSCODE_DIR[] = "transcode";
 static constexpr char PRIMARY_VOLUME_PREFIX[] = "/storage/emulated";
+
+static constexpr char FUSE_BPF_PROG_PATH[] = "/sys/fs/bpf/prog_fuse_media_fuse_media";
+
+enum class BpfFd { UNINITIALIZED = -2, REMOVE = -1 };
 
 /*
  * In order to avoid double caching with fuse, call fadvise on the file handles
@@ -257,6 +265,7 @@ struct fuse {
           zero_addr(0),
           disable_dentry_cache(false),
           passthrough(false),
+          bpf(false),
           supported_transcoding_relative_paths(_supported_transcoding_relative_paths) {}
 
     inline bool IsRoot(const node* node) const { return node == root; }
@@ -280,6 +289,14 @@ struct fuse {
         }
 
         return node::FromInode(inode, &tracker);
+    }
+
+    inline node* FromInodeNoThrow(__u64 inode) {
+        if (inode == FUSE_ROOT_ID) {
+            return root;
+        }
+
+        return node::FromInodeNoThrow(inode, &tracker);
     }
 
     inline __u64 ToInode(node* node) const {
@@ -331,6 +348,10 @@ struct fuse {
     std::atomic_bool* active;
     std::atomic_bool disable_dentry_cache;
     std::atomic_bool passthrough;
+    std::atomic_bool bpf;
+
+    int bpf_fd;
+
     // FUSE device id.
     std::atomic_uint dev;
     const std::vector<string> supported_transcoding_relative_paths;
@@ -414,6 +435,14 @@ static bool is_package_owned_path(const string& path, const string& fuse_path) {
     return std::regex_match(path, PATTERN_OWNED_PATH);
 }
 
+static bool is_data_path(const string& path) {
+    return std::regex_match(path, PATTERN_DATA_PATH);
+}
+
+static bool is_obb_path(const string& path) {
+    return std::regex_match(path, PATTERN_OBB_PATH);
+}
+
 // See fuse_lowlevel.h fuse_lowlevel_notify_inval_entry for how to call this safetly without
 // deadlocking the kernel
 static void fuse_inval(fuse_session* se, fuse_ino_t parent_ino, fuse_ino_t child_ino,
@@ -433,7 +462,7 @@ static void fuse_inval(fuse_session* se, fuse_ino_t parent_ino, fuse_ino_t child
 static double get_entry_timeout(const string& path, bool should_inval, struct fuse* fuse) {
     string media_path = fuse->GetEffectiveRootPath() + "/Android/media";
     if (fuse->disable_dentry_cache || should_inval || is_package_owned_path(path, fuse->path) ||
-        android::base::StartsWith(path, media_path)) {
+        android::base::StartsWithIgnoreCase(path, media_path)) {
         // We set dentry timeout to 0 for the following reasons:
         // 1. The dentry cache was completely disabled
         // 2.1 Case-insensitive lookups need to invalidate other case-insensitive dentry matches
@@ -614,8 +643,19 @@ static node* make_node_entry(fuse_req_t req, node* parent, const string& name, c
     // reuse inode numbers.
     e->generation = 0;
     e->ino = fuse->ToInode(node);
-    e->entry_timeout = get_entry_timeout(path, should_invalidate, fuse);
-    e->attr_timeout = std::numeric_limits<double>::max();
+
+    // When FUSE BPF is used, the caching of node attributes and lookups is
+    // disabled to avoid possible inconsistencies between the FUSE cache and
+    // the lower file system state.
+    // With FUSE BPF the file system requests are forwarded to the lower file
+    // system bypassing the FUSE daemon, so dropping the caching does not
+    // introduce a performance regression.
+    // Currently FUSE BPF is limited to the Android/data and Android/obb
+    // directories.
+    if (!fuse->bpf || !(is_data_path(path) || is_obb_path(path))) {
+        e->entry_timeout = get_entry_timeout(path, should_invalidate, fuse);
+        e->attr_timeout = std::numeric_limits<double>::max();
+    }
     return node;
 }
 
@@ -666,6 +706,8 @@ static void pf_init(void* userdata, struct fuse_conn_info* conn) {
         }
     }
 
+    fuse->bpf_fd = static_cast<int>(BpfFd::UNINITIALIZED);
+
     conn->want |= conn->capable & mask;
     if (disable_splice_write) {
         conn->want &= ~FUSE_CAP_SPLICE_WRITE;
@@ -684,7 +726,9 @@ static void pf_destroy(void* userdata) {
 }
 
 // Return true if the path is accessible for that uid.
-static bool is_app_accessible_path(MediaProviderWrapper* mp, const string& path, uid_t uid) {
+static bool is_app_accessible_path(struct fuse* fuse, const string& path, uid_t uid) {
+    MediaProviderWrapper* mp = fuse->mp;
+
     if (uid < AID_APP_START || uid == MY_UID) {
         return true;
     }
@@ -703,7 +747,7 @@ static bool is_app_accessible_path(MediaProviderWrapper* mp, const string& path,
         if (pkg == ".nomedia") {
             return true;
         }
-        if (android::base::StartsWith(path, PRIMARY_VOLUME_PREFIX)) {
+        if (!fuse->bpf && android::base::StartsWith(path, PRIMARY_VOLUME_PREFIX)) {
             // Emulated storage bind-mounts app-private data directories, and so these
             // should not be accessible through FUSE anyway.
             LOG(WARNING) << "Rejected access to app-private dir on FUSE: " << path
@@ -718,6 +762,51 @@ static bool is_app_accessible_path(MediaProviderWrapper* mp, const string& path,
     return true;
 }
 
+bool fuse_bpf_fill_entries(const string& path, const int bpf_fd, struct fuse_entry_param* e) {
+    const int fd = open(path.c_str(), O_CLOEXEC | O_DIRECTORY | O_RDONLY);
+    if (fd < 0) {
+        PLOG(ERROR) << "Failed to open: " << path;
+        return false;
+    }
+
+    e->backing_action = FUSE_ACTION_REPLACE;
+    e->backing_fd = fd;
+
+    if (bpf_fd >= 0) {
+        e->bpf_action = FUSE_ACTION_REPLACE;
+        e->bpf_fd = bpf_fd;
+    } else if (bpf_fd == static_cast<int>(BpfFd::REMOVE)) {
+        e->bpf_action = FUSE_ACTION_REMOVE;
+    } else {
+        e->bpf_action = FUSE_ACTION_KEEP;
+    }
+
+    return true;
+}
+
+void fuse_bpf_install(struct fuse* fuse, struct fuse_entry_param* e, const string& child_path) {
+    if (fuse->bpf_fd >= 0) {
+        // TODO(b/211873756) Enable only for the primary volume. Must be
+        // extended for other media devices.
+        if (android::base::StartsWith(child_path, PRIMARY_VOLUME_PREFIX)) {
+            if (is_data_path(child_path) || is_obb_path(child_path)) {
+                fuse_bpf_fill_entries(child_path, fuse->bpf_fd, e);
+            } else if (is_package_owned_path(child_path, fuse->path)) {
+                fuse_bpf_fill_entries(child_path, static_cast<int>(BpfFd::REMOVE), e);
+            }
+        }
+    } else if (fuse->bpf_fd == static_cast<int>(BpfFd::UNINITIALIZED)) {
+        // Initialize FUSE BPF
+        fuse->bpf_fd = android::bpf::bpfFdGet(FUSE_BPF_PROG_PATH, BPF_F_RDONLY);
+        if (fuse->bpf_fd < 0) {
+            PLOG(ERROR) << "Failed to fetch BPF prog fd: " << fuse->bpf_fd;
+            fuse->bpf = false;
+        } else {
+            LOG(INFO) << "BPF prog fd fetched";
+        }
+    }
+}
+
 static std::regex storage_emulated_regex("^\\/storage\\/emulated\\/([0-9]+)");
 static node* do_lookup(fuse_req_t req, fuse_ino_t parent, const char* name,
                        struct fuse_entry_param* e, int* error_code, const FuseOp op) {
@@ -730,7 +819,7 @@ static node* do_lookup(fuse_req_t req, fuse_ino_t parent, const char* name,
     string parent_path = parent_node->BuildPath();
     // We should always allow lookups on the root, because failing them could cause
     // bind mounts to be invalidated.
-    if (!fuse->IsRoot(parent_node) && !is_app_accessible_path(fuse->mp, parent_path, req->ctx.uid)) {
+    if (!fuse->IsRoot(parent_node) && !is_app_accessible_path(fuse, parent_path, req->ctx.uid)) {
         *error_code = ENOENT;
         return nullptr;
     }
@@ -753,7 +842,11 @@ static node* do_lookup(fuse_req_t req, fuse_ino_t parent, const char* name,
         }
     }
 
-    return make_node_entry(req, parent_node, name, child_path, e, error_code, op);
+    auto node = make_node_entry(req, parent_node, name, child_path, e, error_code, op);
+
+    if (fuse->bpf) fuse_bpf_install(fuse, e, child_path);
+
+    return node;
 }
 
 static void pf_lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
@@ -823,7 +916,7 @@ static void pf_getattr(fuse_req_t req,
         return;
     }
     const string& path = get_path(node);
-    if (!is_app_accessible_path(fuse->mp, path, req->ctx.uid)) {
+    if (!is_app_accessible_path(fuse, path, req->ctx.uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -851,7 +944,7 @@ static void pf_setattr(fuse_req_t req,
         return;
     }
     const string& path = get_path(node);
-    if (!is_app_accessible_path(fuse->mp, path, req->ctx.uid)) {
+    if (!is_app_accessible_path(fuse, path, req->ctx.uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -946,7 +1039,7 @@ static void pf_canonical_path(fuse_req_t req, fuse_ino_t ino)
     node* node = fuse->FromInode(ino);
     const string& path = node ? get_path(node) : "";
 
-    if (node && is_app_accessible_path(fuse->mp, path, req->ctx.uid)) {
+    if (node && is_app_accessible_path(fuse, path, req->ctx.uid)) {
         // TODO(b/147482155): Check that uid has access to |path| and its contents
         fuse_reply_canonical_path(req, path.c_str());
         return;
@@ -967,7 +1060,7 @@ static void pf_mknod(fuse_req_t req,
         return;
     }
     string parent_path = parent_node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, parent_path, req->ctx.uid)) {
+    if (!is_app_accessible_path(fuse, parent_path, req->ctx.uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -1005,7 +1098,7 @@ static void pf_mkdir(fuse_req_t req,
     }
     const struct fuse_ctx* ctx = fuse_req_ctx(req);
     const string parent_path = parent_node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, parent_path, ctx->uid)) {
+    if (!is_app_accessible_path(fuse, parent_path, ctx->uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -1046,7 +1139,7 @@ static void pf_unlink(fuse_req_t req, fuse_ino_t parent, const char* name) {
     }
     const struct fuse_ctx* ctx = fuse_req_ctx(req);
     const string parent_path = parent_node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, parent_path, ctx->uid)) {
+    if (!is_app_accessible_path(fuse, parent_path, ctx->uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -1075,7 +1168,7 @@ static void pf_rmdir(fuse_req_t req, fuse_ino_t parent, const char* name) {
         return;
     }
     const string parent_path = parent_node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, parent_path, req->ctx.uid)) {
+    if (!is_app_accessible_path(fuse, parent_path, req->ctx.uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -1130,7 +1223,7 @@ static int do_rename(fuse_req_t req, fuse_ino_t parent, const char* name, fuse_i
     if (!old_parent_node) return ENOENT;
     const struct fuse_ctx* ctx = fuse_req_ctx(req);
     const string old_parent_path = old_parent_node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, old_parent_path, ctx->uid)) {
+    if (!is_app_accessible_path(fuse, old_parent_path, ctx->uid)) {
         return ENOENT;
     }
 
@@ -1140,10 +1233,16 @@ static int do_rename(fuse_req_t req, fuse_ino_t parent, const char* name, fuse_i
         return ENOENT;
     }
 
-    node* new_parent_node = fuse->FromInode(new_parent);
-    if (!new_parent_node) return ENOENT;
+    node* new_parent_node;
+    if (fuse->bpf) {
+        new_parent_node = fuse->FromInodeNoThrow(new_parent);
+        if (!new_parent_node) return EXDEV;
+    } else {
+        new_parent_node = fuse->FromInode(new_parent);
+        if (!new_parent_node) return ENOENT;
+    }
     const string new_parent_path = new_parent_node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, new_parent_path, ctx->uid)) {
+    if (!is_app_accessible_path(fuse, new_parent_path, ctx->uid)) {
         return ENOENT;
     }
 
@@ -1319,7 +1418,7 @@ static void pf_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi) {
     const struct fuse_ctx* ctx = fuse_req_ctx(req);
     const string& io_path = get_path(node);
     const string& build_path = node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, io_path, ctx->uid)) {
+    if (!is_app_accessible_path(fuse, io_path, ctx->uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -1606,7 +1705,7 @@ static void pf_opendir(fuse_req_t req,
     }
     const struct fuse_ctx* ctx = fuse_req_ctx(req);
     const string path = node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, path, ctx->uid)) {
+    if (!is_app_accessible_path(fuse, path, ctx->uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -1656,7 +1755,7 @@ static void do_readdir_common(fuse_req_t req,
         return;
     }
     const string path = node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, path, req->ctx.uid)) {
+    if (!is_app_accessible_path(fuse, path, req->ctx.uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -1804,7 +1903,7 @@ static void pf_access(fuse_req_t req, fuse_ino_t ino, int mask) {
         return;
     }
     const string path = node->BuildPath();
-    if (path != PRIMARY_VOLUME_PREFIX && !is_app_accessible_path(fuse->mp, path, req->ctx.uid)) {
+    if (path != PRIMARY_VOLUME_PREFIX && !is_app_accessible_path(fuse, path, req->ctx.uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -1869,7 +1968,7 @@ static void pf_create(fuse_req_t req,
         return;
     }
     const string parent_path = parent_node->BuildPath();
-    if (!is_app_accessible_path(fuse->mp, parent_path, req->ctx.uid)) {
+    if (!is_app_accessible_path(fuse, parent_path, req->ctx.uid)) {
         fuse_reply_err(req, ENOENT);
         return;
     }
@@ -2148,6 +2247,11 @@ void FuseDaemon::Start(android::base::unique_fd fd, const std::string& path,
     fuse->passthrough = android::base::GetBoolProperty("persist.sys.fuse.passthrough.enable", false);
     if (fuse->passthrough) {
         LOG(INFO) << "Using FUSE passthrough";
+    }
+
+    fuse->bpf = android::base::GetBoolProperty("persist.sys.fuse.bpf.enable", false);
+    if (fuse->bpf) {
+        LOG(INFO) << "Using FUSE BPF";
     }
 
     struct fuse_session
